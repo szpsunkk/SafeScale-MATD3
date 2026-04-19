@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 
 @dataclass
@@ -14,7 +15,7 @@ class SimConfig:
     # Platoon / traffic
     n_platoons: int = 5
     n_priorities: int = 3
-    priority_weights: tuple = (5.0, 2.0, 0.5)  # m=1,2,3
+    priority_weights: tuple = (4.5, 2.5, 0.5)  # m=1,2,3
 
     # Two-timescale
     tau_s: float = 1.0
@@ -23,17 +24,15 @@ class SimConfig:
 
     # Safety constraints
     # n_safe is the AoI threshold (ticks) before a violation is counted.
-    # Rule-of-thumb: must be > n_ac so that missing ONE slot does NOT
-    # automatically cause a violation (slot-level scheduling has n_ac ticks
-    # per slot; a skipped slot adds n_ac ticks to AoI).
-    # Values below are ~2× / 4× / 10× n_ac respectively.
-    n_safe: tuple = (12, 20, 100)        # m=1,2,3 (ticks)  — 10→12 gives m=1 ~20% more margin
+    # Paper setting (Table II): nsafe_v,1 / nsafe_v,2 / nsafe_v,3 = 5 / 10 / 50.
+    n_safe: tuple = (5, 10, 50)          # m=1,2,3 (ticks)
     epsilon: tuple = (0.01, 0.05, 0.20)  # m=1,2,3
     # Background transmission probability for non-selected priorities.
-    # Models the paper's intra-slot scheduling where ALL messages receive
-    # some resource allocation; selected priority gets a boost.
-    # Reduced to 0.08 so methods without safety queues see more violations.
-    p_bg: float = 0.08
+    # With K=3 subchannels (Table II), each priority receives a dedicated
+    # OFDMA sub-channel. The selected priority gets the best subchannel
+    # (high power → ~70% success), others get lower-power secondary
+    # subchannels at ~35% success rate.
+    p_bg: float = 0.42
 
     # Handover dynamics
     ho_delay_mean_ms: float = 225.0
@@ -41,19 +40,57 @@ class SimConfig:
     ho_period_s: float = 15.0
 
     # Training / evaluation
-    n_episodes: int = 2000
-    episode_slots: int = 300
-    eval_episodes: int = 100
-    n_seeds: int = 5
+    # episode_slots=150 → 150 s/episode, forced HO every 15 s ≈ 10 forced HOs/ep
+    # n_episodes=400 → enough to show convergence trend with NN policies
+    # n_seeds=3 → mean ± CI still meaningful, 3× faster than 5
+    n_episodes: int = 3000
+    episode_slots: int = 150
+    eval_episodes: int = 50
+    n_seeds: int = 3
+    # Train once every `update_interval` env steps (speed/throughput tradeoff).
+    update_interval: int = 4
+
+    # Neural SafeScale-MATD3 only (TD3 augmented reward, Lyapunov dual κ on mean Z̄).
+    # κ multiplies mean virtual-queue backlog per (platoon, priority); see neural_policies TD3Agent.
+    nn_safety_coeff: float = 0.35
+    # Ramp κ from 0 → nn_safety_over this many env steps so early learning tracks env reward.
+    nn_safety_warmup_env_steps: int = 12000
+    # Safety shield: when urgency is high, SafeScale action is constrained to
+    # prioritize m=1 and avoid unnecessary discretionary handover outages.
+    nn_safety_shield_urgency: float = 1.35
+    nn_safety_shield_power_floor: float = 0.50
 
     # Reward shaping
     w_power: float = 0.02
     w_handover: float = 0.3
 
+    # Reward coefficients (main.pdf Eq. (39)-(42))
+    kappa1: float = 1.0      # AoI penalty weight
+    kappa2: float = 0.5      # rate-bonus weight
+    kappa3_m1: float = 2.0   # m=1 safety overflow quadratic penalty
+    kappa3_m2: float = 1.0   # m=2 safety overflow quadratic penalty
+    kappa1_m3: float = 0.5   # m=3 AoI penalty weight
+    kappa4: float = 0.1      # normalized power penalty
+    kappa5: float = 0.3      # proactive handover prediction bonus
+
+    # Throughput model thresholds used in G(R - R_min)
+    rmin_m1: float = 0.8
+    rmin_m2: float = 0.5
+
+    # Simplified physical-layer reward model constants
+    sinr_noise_floor: float = 0.05
+    interference_coupling: float = 0.6
+
+    # Proactive timing window (paper uses Tpre = 3 s)
+    t_pre_s: float = 3.0
+
     # Output
     output_dir: Path = field(
         default_factory=lambda: Path("outputs")
     )
+    # If set, figures and results go to output_dir / output_run_id / {figures,results}
+    # so multiple runs (e.g. different hyperparameters) do not overwrite each other.
+    output_run_id: Optional[str] = None
 
     @property
     def forced_period_slots(self) -> int:

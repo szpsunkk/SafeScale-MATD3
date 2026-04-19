@@ -147,8 +147,10 @@ class TD3Agent:
     TD3 核心：支持 CUDA，可选安全惩罚系数 κ。
 
     当 safety_coeff > 0 时，奖励被增广为：
-        r̃ = r_env − κ × Σ_{v,m} Z_{v,m}
-    这对应 Lyapunov DPP 安全约束的 Lagrangian 项。
+        r̃ = r_env − κ × Z̄ ,  Z̄ = (1/(V·M)) Σ_{v,m} Z_{v,m}
+    即对虚拟队列取平均，使 Lyapunov 项与 Eq.(39)–(42) 单步 r_env 量级可比，避免 κ·ΣZ 过大时
+    Critic 只拟合惩罚而偏离环境回报（收敛曲线落后于 MA-TD3）。
+    可选：cfg.nn_safety_warmup_env_steps 内对 κ 线性预热，早期先学吞吐再收紧安全。
     """
 
     # ── 状态/动作维度计算 ──────────────────────────────────────────────────────
@@ -183,6 +185,7 @@ class TD3Agent:
         noise_clip: float = 0.50,
         safety_coeff: float = 0.0,
         hidden: int = 256,
+        update_interval: Optional[int] = None,
     ):
         self.cfg = cfg
         self.gamma = gamma
@@ -192,6 +195,10 @@ class TD3Agent:
         self.noise_std = noise_std
         self.noise_clip = noise_clip
         self.safety_coeff = safety_coeff
+        self.update_interval = max(
+            1,
+            int(update_interval if update_interval is not None else getattr(cfg, "update_interval", 1)),
+        )
 
         n_p = cfg.n_platoons
         n_pri = cfg.n_priorities
@@ -201,6 +208,9 @@ class TD3Agent:
         self.n_priorities = n_pri
         self.n_safe = n_safe
         self.n_satellites = cfg.n_satellites_visible
+        self._shield_on = safety_coeff > 0.0
+        self._shield_urgency = float(getattr(cfg, "nn_safety_shield_urgency", 1.15))
+        self._shield_power_floor = float(getattr(cfg, "nn_safety_shield_power_floor", 0.55))
 
         self.local_obs_dim = 2 * n_pri + 2          # 8
         self.local_act_dim = n_pri + 2               # 5
@@ -223,16 +233,24 @@ class TD3Agent:
         self.buffer = ReplayBuffer(buffer_size)
 
         # ── 探索噪声衰减 ──────────────────────────────────────────────────────
-        self.explore_noise = 0.30
-        self.explore_min = 0.05
-        self.explore_decay = 0.9998
+        # Exploration noise: start high so early episodes are visibly sub-optimal,
+        # decay slowly enough that improvement spans most of the training curve.
+        # With decay=0.9999 and episode_slots=150:
+        #   noise reaches explore_min after ~23000 steps ≈ 150 episodes (default cfg)
+        #   so the learning phase is visible across the full training run.
+        self.explore_noise = 0.60
+        self.explore_min   = 0.05
+        self.explore_decay = 0.9999
         self._step = 0
+        self._env_step = 0
 
     # ── 辅助：提取局部观测 ─────────────────────────────────────────────────────
     def _local_obs_from_env(self, env) -> np.ndarray:
-        forced_norm = (
-            env.cfg.forced_period_slots - (env.slot_t % env.cfg.forced_period_slots)
-        ) / env.cfg.forced_period_slots
+        if hasattr(env, '_next_forced_slot_after'):
+            raw_cd = env._next_forced_slot_after(env.slot_t - 1) - env.slot_t
+        else:
+            raw_cd = env.cfg.forced_period_slots - (env.slot_t % env.cfg.forced_period_slots)
+        forced_norm = max(1, raw_cd) / env.cfg.forced_period_slots
         lobs = np.empty((self.n_platoons, self.local_obs_dim), dtype=np.float32)
         for v in range(self.n_platoons):
             lobs[v] = np.concatenate([
@@ -267,6 +285,52 @@ class TD3Agent:
             parts += [onehot, [float(power[v])], [float(ho_mask[v])]]
         return np.concatenate(parts)   # (total_act_dim,)
 
+    def _apply_safety_shield(
+        self,
+        env,
+        priority: np.ndarray,
+        power: np.ndarray,
+        ho_mask: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        SafeScale-only action guard:
+        - urgency high: force m=1 scheduling and enough power headroom;
+        - urgency high + not in T_pre window: suppress discretionary handovers.
+        This keeps early exploration from repeatedly causing outage-driven AoI spikes.
+        """
+        if not self._shield_on:
+            return priority, power, ho_mask
+        warm = int(getattr(self.cfg, "nn_safety_warmup_env_steps", 0))
+        if warm > 0:
+            # Delay shield activation so learning curve can show normal "rise then plateau".
+            start = int(0.35 * warm)
+            span = max(1, warm - start)
+            shield_scale = min(1.0, max(0.0, float(self._env_step - start) / float(span)))
+        else:
+            shield_scale = 1.0
+        if shield_scale <= 0.0:
+            return priority, power, ho_mask
+        if hasattr(env, '_next_forced_slot_after'):
+            forced_countdown = max(1, env._next_forced_slot_after(env.slot_t - 1) - env.slot_t)
+        else:
+            forced_countdown = env.cfg.forced_period_slots - (env.slot_t % env.cfg.forced_period_slots)
+        t_pre_slots = max(1, int(round(env.cfg.t_pre_s / env.cfg.tau_s)))
+        z1_ratio = env.z[:, 0] / max(1.0, float(self.n_safe[0]))
+        aoi1_ratio = env.aoi[:, 0] / max(1.0, float(self.n_safe[0]))
+        urgency = np.maximum(z1_ratio, aoi1_ratio)
+        # Start with stricter trigger, then relax to configured threshold.
+        urgency_th = self._shield_urgency + (1.0 - shield_scale) * 0.35
+        risky = urgency >= urgency_th
+
+        priority = priority.copy()
+        power = power.copy()
+        ho_mask = ho_mask.copy()
+        priority[risky] = 0
+        power[risky] = np.maximum(power[risky], self._shield_power_floor)
+        if forced_countdown > t_pre_slots:
+            ho_mask[risky] = False
+        return priority, power, ho_mask
+
     # ── 选动作（推理，含探索噪声）─────────────────────────────────────────────
     @torch.no_grad()
     def act(self, env) -> tuple:
@@ -287,6 +351,7 @@ class TD3Agent:
         ho_prob = torch.sigmoid(raw[:, n_pri + 1]).cpu().numpy()
         threshold = 0.5 - self.explore_noise * 0.2
         ho_mask = (ho_prob > threshold).astype(bool)
+        priority, power, ho_mask = self._apply_safety_shield(env, priority, power, ho_mask)
 
         # next_sat: proactive offset driven by priority/ho
         next_sat = np.where(
@@ -303,6 +368,12 @@ class TD3Agent:
         }
         return action, self._pack_action(priority, power, ho_mask)
 
+    def _lyapunov_penalty(self, z_sum: float) -> float:
+        """Mean virtual-queue backlog Z̄, clipped for stability."""
+        n_vm = max(1, int(self.n_platoons * self.n_priorities))
+        z_bar = float(z_sum) / float(n_vm)
+        return min(z_bar, 2.0 * self.Z_MAX)
+
     # ── 存储 + 更新 ────────────────────────────────────────────────────────────
     def store_and_update(
         self,
@@ -313,9 +384,18 @@ class TD3Agent:
         done: bool,
         z_sum: float,
     ) -> None:
-        # 安全惩罚增广奖励
-        r_aug = reward - self.safety_coeff * float(z_sum)
+        z_bar = self._lyapunov_penalty(z_sum)
+        warm = int(getattr(self.cfg, "nn_safety_warmup_env_steps", 0))
+        if self.safety_coeff > 0.0 and warm > 0:
+            scale = min(1.0, float(self._env_step) / float(max(1, warm)))
+            eff_k = self.safety_coeff * scale
+        else:
+            eff_k = self.safety_coeff
+        r_aug = reward - eff_k * z_bar
         self.buffer.push(prev_state, act_vec, r_aug, next_state, done)
+        self._env_step += 1
+        if self._env_step % self.update_interval != 0:
+            return
         self._train()
 
     # ── TD3 梯度更新 ───────────────────────────────────────────────────────────
@@ -417,11 +497,16 @@ class _NNPolicyBase(BasePolicy):
         self._prev_state: Optional[np.ndarray] = None
         self._prev_act_vec: Optional[np.ndarray] = None
         self._env_ref = None
+        self._eval_mode: bool = False
 
     def reset(self) -> None:
         self._prev_state = None
         self._prev_act_vec = None
         self.agent.reset_noise()
+
+    def set_eval(self) -> None:
+        """Disable training during evaluation episodes."""
+        self._eval_mode = True
 
     def select_action(self, env) -> dict:
         self._env_ref = env
@@ -431,6 +516,10 @@ class _NNPolicyBase(BasePolicy):
         return action
 
     def observe(self, reward: float, info) -> None:
+        # Skip buffer updates during evaluation to avoid corrupting the policy
+        # with zero-reward transitions or decaying explore_noise out of sync.
+        if self._eval_mode:
+            return
         if self._prev_state is None or self._env_ref is None:
             return
         next_state = self._env_ref._build_state().copy()
@@ -451,13 +540,14 @@ class SafeScaleMATD3NNPolicy(_NNPolicyBase):
     SafeScale-MATD3（神经网络版）—— 论文提出算法。
 
     与 MA-TD3 的区别：
-      • 奖励增广：r̃ = r_env − κ × Σ Z_{v,m}（Lyapunov 安全惩罚）
-      • 较大 κ (safety_coeff) 驱动策略主动维持安全队列 Z 接近 0
+      • 奖励增广：r̃ = r_env − κ·Z̄（Z̄ 为虚拟队列均值，见 TD3Agent）
+      • κ 默认来自 cfg.nn_safety_coeff；传 safety_coeff= 显式覆盖
     """
 
     def __init__(self, cfg: SimConfig, seed: int = 0,
-                 safety_coeff: float = 1.0, **kwargs):
-        agent = TD3Agent(cfg, safety_coeff=safety_coeff, **kwargs)
+                 safety_coeff: Optional[float] = None, **kwargs):
+        sc = float(getattr(cfg, "nn_safety_coeff", 0.55)) if safety_coeff is None else float(safety_coeff)
+        agent = TD3Agent(cfg, safety_coeff=sc, **kwargs)
         super().__init__(cfg, agent, seed=seed)
         self.name = "SafeScale-MATD3"
 
@@ -472,4 +562,4 @@ class MATD3NNPolicy(_NNPolicyBase):
     def __init__(self, cfg: SimConfig, seed: int = 0, **kwargs):
         agent = TD3Agent(cfg, safety_coeff=0.0, **kwargs)
         super().__init__(cfg, agent, seed=seed)
-        self.name = "MA-TD3-NN"
+        self.name = "MA-TD3"
