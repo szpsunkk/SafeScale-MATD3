@@ -115,11 +115,14 @@ All hyperparameters are centralized in `config.py` via the `SimConfig` dataclass
 If you use this code in your research, please cite:
 
 ```bibtex
-@article{safescale2025,
-  title={SafeScale-MATD3: Safety-Constrained Multi-Agent TD3 for Satellite Handover and Priority Scheduling in Vehicle Platoon Communications},
-  author={},
-  journal={},
-  year={2025}
+@misc{sun2026safetyawareaoischedulingleo,
+      title={Safety-Aware AoI Scheduling for LEO Satellite-Assisted Autonomous Driving}, 
+      author={Kangkang Sun and Junyi He and Juntong Liu and Xiuzhen Chen and Jianhua Li and Minyi Guo},
+      year={2026},
+      eprint={2604.17281},
+      archivePrefix={arXiv},
+      primaryClass={cs.NI},
+      url={https://arxiv.org/abs/2604.17281}, 
 }
 ```
 
